@@ -23,7 +23,10 @@ from ray.actor import ActorHandle
 from ray.dashboard.modules.job.common import (
     JOB_ID_METADATA_KEY,
     JOB_NAME_METADATA_KEY,
+    OOM_EXIT_CODE,
     JobInfoStorageClient,
+    JobRetryCondition,
+    RetryPolicy,
 )
 from ray.dashboard.modules.job.job_log_storage_client import JobLogStorageClient
 from ray.job_submission import JobErrorType, JobStatus
@@ -76,12 +79,15 @@ class JobSupervisor:
         gcs_address: str,
         cluster_id_hex: str,
         logs_dir: Optional[str] = None,
+        retry_policy: Optional[Dict[str, Any]] = None,
     ):
         self._job_id = job_id
         gcs_client = GcsClient(address=gcs_address, cluster_id=cluster_id_hex)
         self._job_info_client = JobInfoStorageClient(gcs_client, logs_dir)
         self._log_client = JobLogStorageClient()
         self._entrypoint = entrypoint
+        # In-place retry policy (parsed from the flattened dict), or None.
+        self._retry_policy = RetryPolicy(**retry_policy) if retry_policy else None
 
         # Default metadata if not passed by the user.
         self._metadata = {JOB_ID_METADATA_KEY: job_id, JOB_NAME_METADATA_KEY: job_id}
@@ -152,7 +158,9 @@ class JobSupervisor:
         """Used to check the health of the actor."""
         pass
 
-    def _exec_entrypoint(self, env: dict, logs_path: str) -> subprocess.Popen:
+    def _exec_entrypoint(
+        self, env: dict, logs_path: str, attempt: int = 0
+    ) -> subprocess.Popen:
         """
         Runs the entrypoint command as a child process, streaming stderr &
         stdout to given log files.
@@ -176,6 +184,8 @@ class JobSupervisor:
         # Open in append mode to avoid overwriting runtime_env setup logs for the
         # supervisor actor, which are also written to the same file.
         with open(logs_path, "a") as logs_file:
+            if attempt > 0:
+                logs_file.write(f"=== Attempt {attempt} (retry) ===\n")
             logs_file.write(
                 f"Running entrypoint for job {self._job_id}: {self._entrypoint}\n"
             )
@@ -307,6 +317,139 @@ class JobSupervisor:
                 # Process is already dead
                 pass
 
+    async def _run_attempt(
+        self, attempt: int, resources_specified: bool
+    ) -> Optional[int]:
+        """Execute the driver subprocess once.
+
+        Returns the driver's exit code, or None if the job was stopped (via the
+        stop event) before the driver finished.
+        """
+        # Configure environment variables for the child process.
+        env = os.environ.copy()
+        # Remove internal Ray flags. They present because JobSuperVisor itself is
+        # a Ray worker process but we don't want to pass them to the driver.
+        remove_ray_internal_flags_from_env(env)
+        # These will *not* be set in the runtime_env, so they apply to the driver
+        # only, not its tasks & actors.
+        env.update(self._get_driver_env_vars(resources_specified))
+
+        self._logger.info(
+            "Submitting job with RAY_ADDRESS = "
+            f"{env[ray_constants.RAY_ADDRESS_ENVIRONMENT_VARIABLE]}"
+        )
+        log_path = self._log_client.get_log_file_path(self._job_id)
+        child_process = self._exec_entrypoint(env, log_path, attempt)
+        child_pid = child_process.pid
+
+        polling_task = create_task(self._polling(child_process))
+        stop_task = create_task(self._stop_event.wait())
+        finished, pending = await asyncio.wait(
+            [polling_task, stop_task],
+            return_when=FIRST_COMPLETED,
+        )
+        # Cancel whichever task is still pending so it doesn't leak across
+        # retries (e.g. the stop-event waiter when the driver finishes first).
+        for task in pending:
+            task.cancel()
+
+        if self._stop_event.is_set():
+            polling_task.cancel()
+            if sys.platform == "win32" and self._win32_job_object:
+                win32job.TerminateJobObject(self._win32_job_object, -1)
+            elif sys.platform != "win32":
+                stop_signal = os.environ.get("RAY_JOB_STOP_SIGNAL", "SIGTERM")
+                if stop_signal not in self.VALID_STOP_SIGNALS:
+                    self._logger.warning(
+                        f"{stop_signal} not a valid stop signal. Terminating "
+                        "job with SIGTERM."
+                    )
+                    stop_signal = "SIGTERM"
+
+                job_process = psutil.Process(child_pid)
+                proc_to_kill = [job_process] + job_process.children(recursive=True)
+
+                # Send stop signal and wait for job to terminate gracefully,
+                # otherwise SIGKILL job forcefully after timeout.
+                self._kill_processes(proc_to_kill, getattr(signal, stop_signal))
+                try:
+                    stop_job_wait_time = int(
+                        os.environ.get(
+                            "RAY_JOB_STOP_WAIT_TIME_S",
+                            self.DEFAULT_RAY_JOB_STOP_WAIT_TIME_S,
+                        )
+                    )
+                    poll_job_stop_task = create_task(self._poll_all(proc_to_kill))
+                    await asyncio.wait_for(poll_job_stop_task, stop_job_wait_time)
+                    self._logger.info(
+                        f"Job {self._job_id} has been terminated gracefully "
+                        f"with {stop_signal}."
+                    )
+                except asyncio.TimeoutError:
+                    self._logger.warning(
+                        f"Attempt to gracefully terminate job {self._job_id} "
+                        f"through {stop_signal} has timed out after "
+                        f"{stop_job_wait_time} seconds. Job is now being "
+                        "force-killed with SIGKILL."
+                    )
+                    self._kill_processes(proc_to_kill, signal.SIGKILL)
+            return None
+
+        # Child process finished execution and no stop event is set
+        # at the same time.
+        assert len(finished) == 1, "Should have only one coroutine done"
+        [child_process_task] = finished
+        return_code = child_process_task.result()
+        self._logger.info(
+            f"Job {self._job_id} entrypoint command exited with code {return_code}"
+        )
+        return return_code
+
+    def _should_retry(self, return_code: int, attempt: int) -> bool:
+        """Return whether the driver should be retried after a non-zero exit."""
+        policy = self._retry_policy
+        if policy is None or policy.max_retries <= 0:
+            return False
+        if attempt >= policy.max_retries:
+            return False
+        if (
+            policy.no_retry_on_exit_codes
+            and return_code in policy.no_retry_on_exit_codes
+        ):
+            return False
+        conditions = policy.retry_on or [JobRetryCondition.NON_ZERO_EXIT.value]
+        if JobRetryCondition.NON_ZERO_EXIT.value in conditions and return_code != 0:
+            return True
+        if (
+            JobRetryCondition.DRIVER_OOM.value in conditions
+            and return_code == OOM_EXIT_CODE
+        ):
+            return True
+        return False
+
+    def _compute_backoff(self, attempt: int) -> float:
+        """Compute the (capped) exponential backoff delay for an attempt."""
+        policy = self._retry_policy
+        delay = policy.backoff_initial_delay_seconds * (
+            policy.backoff_multiplier**attempt
+        )
+        return min(delay, policy.backoff_max_delay_seconds)
+
+    async def _interruptible_backoff(self, delay: float) -> bool:
+        """Sleep for ``delay`` seconds, returning early if a stop is requested.
+
+        Returns True if the stop event fired during the wait, False if the full
+        delay elapsed. Using the stop event (instead of ``asyncio.sleep``) means
+        ``stop_job`` takes effect immediately rather than waiting out the delay.
+        """
+        if delay <= 0:
+            return self._stop_event.is_set()
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def run(
         self,
         # Signal actor used in testing to capture PENDING -> RUNNING cases
@@ -356,108 +499,78 @@ class JobSupervisor:
         )
 
         try:
-            # Configure environment variables for the child process.
-            env = os.environ.copy()
-            # Remove internal Ray flags. They present because JobSuperVisor itself is
-            # a Ray worker process but we don't want to pass them to the driver.
-            remove_ray_internal_flags_from_env(env)
-            # These will *not* be set in the runtime_env, so they apply to the driver
-            # only, not its tasks & actors.
-            env.update(self._get_driver_env_vars(resources_specified))
+            attempt = 0
+            while True:
+                return_code = await self._run_attempt(attempt, resources_specified)
 
-            self._logger.info(
-                "Submitting job with RAY_ADDRESS = "
-                f"{env[ray_constants.RAY_ADDRESS_ENVIRONMENT_VARIABLE]}"
-            )
-            log_path = self._log_client.get_log_file_path(self._job_id)
-            child_process = self._exec_entrypoint(env, log_path)
-            child_pid = child_process.pid
+                if return_code is None:
+                    # Job was stopped by the user (possibly mid-attempt).
+                    await self._job_info_client.put_status(
+                        self._job_id, JobStatus.STOPPED
+                    )
+                    return
 
-            polling_task = create_task(self._polling(child_process))
-            finished, _ = await asyncio.wait(
-                [polling_task, create_task(self._stop_event.wait())],
-                return_when=FIRST_COMPLETED,
-            )
-
-            if self._stop_event.is_set():
-                polling_task.cancel()
-                if sys.platform == "win32" and self._win32_job_object:
-                    win32job.TerminateJobObject(self._win32_job_object, -1)
-                elif sys.platform != "win32":
-                    stop_signal = os.environ.get("RAY_JOB_STOP_SIGNAL", "SIGTERM")
-                    if stop_signal not in self.VALID_STOP_SIGNALS:
-                        self._logger.warning(
-                            f"{stop_signal} not a valid stop signal. Terminating "
-                            "job with SIGTERM."
-                        )
-                        stop_signal = "SIGTERM"
-
-                    job_process = psutil.Process(child_pid)
-                    proc_to_kill = [job_process] + job_process.children(recursive=True)
-
-                    # Send stop signal and wait for job to terminate gracefully,
-                    # otherwise SIGKILL job forcefully after timeout.
-                    self._kill_processes(proc_to_kill, getattr(signal, stop_signal))
-                    try:
-                        stop_job_wait_time = int(
-                            os.environ.get(
-                                "RAY_JOB_STOP_WAIT_TIME_S",
-                                self.DEFAULT_RAY_JOB_STOP_WAIT_TIME_S,
-                            )
-                        )
-                        poll_job_stop_task = create_task(self._poll_all(proc_to_kill))
-                        await asyncio.wait_for(poll_job_stop_task, stop_job_wait_time)
-                        self._logger.info(
-                            f"Job {self._job_id} has been terminated gracefully "
-                            f"with {stop_signal}."
-                        )
-                    except asyncio.TimeoutError:
-                        self._logger.warning(
-                            f"Attempt to gracefully terminate job {self._job_id} "
-                            f"through {stop_signal} has timed out after "
-                            f"{stop_job_wait_time} seconds. Job is now being "
-                            "force-killed with SIGKILL."
-                        )
-                        self._kill_processes(proc_to_kill, signal.SIGKILL)
-
-                await self._job_info_client.put_status(self._job_id, JobStatus.STOPPED)
-            else:
-                # Child process finished execution and no stop event is set
-                # at the same time
-                assert len(finished) == 1, "Should have only one coroutine done"
-                [child_process_task] = finished
-                return_code = child_process_task.result()
-                self._logger.info(
-                    f"Job {self._job_id} entrypoint command "
-                    f"exited with code {return_code}"
-                )
                 if return_code == 0:
                     await self._job_info_client.put_status(
                         self._job_id,
                         JobStatus.SUCCEEDED,
                         driver_exit_code=return_code,
+                        jobinfo_replace_kwargs={"attempt_number": attempt},
                     )
-                else:
-                    log_tail = await self._log_client.get_last_n_log_lines(self._job_id)
-                    if log_tail is not None and log_tail != "":
-                        message = (
-                            "Job entrypoint command "
-                            f"failed with exit code {return_code}, "
-                            "last available logs (truncated to 20,000 chars):\n"
-                            + log_tail
-                        )
-                    else:
-                        message = (
-                            "Job entrypoint command "
-                            f"failed with exit code {return_code}. No logs available."
-                        )
+                    return
+
+                if self._should_retry(return_code, attempt):
+                    delay = self._compute_backoff(attempt)
+                    self._logger.info(
+                        f"Job {self._job_id} attempt {attempt} failed with exit "
+                        f"code {return_code}. Retrying in {delay} seconds "
+                        f"(retry {attempt + 1} of {self._retry_policy.max_retries})."
+                    )
+                    # Keep the job RUNNING (not terminal) between attempts and bump
+                    # the attempt counter so it is observable via the status API.
                     await self._job_info_client.put_status(
                         self._job_id,
-                        JobStatus.FAILED,
-                        message=message,
-                        driver_exit_code=return_code,
-                        error_type=JobErrorType.JOB_ENTRYPOINT_COMMAND_ERROR,
+                        JobStatus.RUNNING,
+                        message=(
+                            "Job entrypoint command failed with exit code "
+                            f"{return_code} on attempt {attempt}; retrying "
+                            f"(retry {attempt + 1} of "
+                            f"{self._retry_policy.max_retries})."
+                        ),
+                        jobinfo_replace_kwargs={"attempt_number": attempt + 1},
                     )
+                    interrupted = await self._interruptible_backoff(delay)
+                    if interrupted:
+                        # Stop requested during the backoff window.
+                        await self._job_info_client.put_status(
+                            self._job_id, JobStatus.STOPPED
+                        )
+                        return
+                    attempt += 1
+                    continue
+
+                # Non-retryable failure: terminal FAILED.
+                log_tail = await self._log_client.get_last_n_log_lines(self._job_id)
+                if log_tail is not None and log_tail != "":
+                    message = (
+                        "Job entrypoint command "
+                        f"failed with exit code {return_code}, "
+                        "last available logs (truncated to 20,000 chars):\n" + log_tail
+                    )
+                else:
+                    message = (
+                        "Job entrypoint command "
+                        f"failed with exit code {return_code}. No logs available."
+                    )
+                await self._job_info_client.put_status(
+                    self._job_id,
+                    JobStatus.FAILED,
+                    message=message,
+                    driver_exit_code=return_code,
+                    error_type=JobErrorType.JOB_ENTRYPOINT_COMMAND_ERROR,
+                    jobinfo_replace_kwargs={"attempt_number": attempt},
+                )
+                return
         except Exception:
             self._logger.error(
                 "Got unexpected exception while trying to execute driver "

@@ -586,6 +586,102 @@ async def check_job_pending(job_manager, job_id):
     return status == JobStatus.PENDING
 
 
+@pytest.mark.asyncio
+async def test_retry_policy_succeeds_after_retries(job_manager, tmp_path):
+    """A flaky driver that fails twice then succeeds is retried in place."""
+    counter_file = tmp_path / "counter"
+    script = tmp_path / "flaky.py"
+    script.write_text(
+        "import os, sys\n"
+        f"p = {repr(str(counter_file))}\n"
+        "n = int(open(p).read()) if os.path.exists(p) else 0\n"
+        "n += 1\n"
+        "open(p, 'w').write(str(n))\n"
+        # Succeed only on the 3rd run (original attempt + 2 retries).
+        "sys.exit(0 if n >= 3 else 1)\n"
+    )
+    submission_id = await job_manager.submit_job(
+        entrypoint=f"{sys.executable} {script}",
+        retry_policy={"max_retries": 5, "backoff_initial_delay_seconds": 0},
+    )
+    await async_wait_for_condition(
+        check_job_succeeded, job_manager=job_manager, job_id=submission_id, timeout=30
+    )
+    info = await job_manager.get_job_info(submission_id)
+    # attempt 0 (original) + attempt 1 + attempt 2 (succeeds) == 3 runs.
+    assert info.attempt_number == 2
+    assert int(counter_file.read_text()) == 3
+    assert info.driver_exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_policy_exhausted_fails(job_manager, tmp_path):
+    """A driver that always fails ends up FAILED after exhausting retries."""
+    submission_id = await job_manager.submit_job(
+        entrypoint="exit 1",
+        retry_policy={"max_retries": 2, "backoff_initial_delay_seconds": 0},
+    )
+    await async_wait_for_condition(
+        check_job_failed, job_manager=job_manager, job_id=submission_id, timeout=30
+    )
+    info = await job_manager.get_job_info(submission_id)
+    assert info.attempt_number == 2
+    assert info.error_type == JobErrorType.JOB_ENTRYPOINT_COMMAND_ERROR
+    assert info.driver_exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_policy_no_retry_on_exit_code(job_manager, tmp_path):
+    """An exit code in no_retry_on_exit_codes fails immediately, no retries."""
+    submission_id = await job_manager.submit_job(
+        entrypoint="exit 130",
+        retry_policy={
+            "max_retries": 3,
+            "backoff_initial_delay_seconds": 0,
+            "retry_on": ["NON_ZERO_EXIT"],
+            "no_retry_on_exit_codes": [130],
+        },
+    )
+    await async_wait_for_condition(
+        check_job_failed, job_manager=job_manager, job_id=submission_id, timeout=30
+    )
+    info = await job_manager.get_job_info(submission_id)
+    assert info.attempt_number == 0
+    assert info.driver_exit_code == 130
+
+
+@pytest.mark.asyncio
+async def test_retry_policy_stop_during_backoff(job_manager, tmp_path):
+    """stop_job during the backoff window takes effect immediately."""
+    submission_id = await job_manager.submit_job(
+        entrypoint="exit 1",
+        # Long backoff so the test would hang if stop didn't interrupt it.
+        retry_policy={"max_retries": 3, "backoff_initial_delay_seconds": 30},
+    )
+
+    async def _in_backoff():
+        info = await job_manager.get_job_info(submission_id)
+        return info.attempt_number == 1 and info.status == JobStatus.RUNNING
+
+    await async_wait_for_condition(_in_backoff, timeout=30)
+    assert job_manager.stop_job(submission_id)
+    await async_wait_for_condition(
+        check_job_stopped, job_manager=job_manager, job_id=submission_id, timeout=10
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_retry_policy_fails_immediately(job_manager, tmp_path):
+    """Without a retry policy, a failing job goes straight to FAILED."""
+    submission_id = await job_manager.submit_job(entrypoint="exit 1")
+    await async_wait_for_condition(
+        check_job_failed, job_manager=job_manager, job_id=submission_id, timeout=30
+    )
+    info = await job_manager.get_job_info(submission_id)
+    assert info.attempt_number == 0
+    assert info.driver_exit_code == 1
+
+
 def check_subprocess_cleaned(pid):
     return psutil.pid_exists(pid) is False
 

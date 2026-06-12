@@ -11,8 +11,10 @@ from ray.dashboard.modules.job.common import (
     JobErrorType,
     JobInfo,
     JobInfoStorageClient,
+    JobRetryCondition,
     JobStatus,
     JobSubmitRequest,
+    RetryPolicy,
     http_uri_components_to_uri,
     uri_to_http_components,
     validate_request_type,
@@ -128,6 +130,133 @@ class TestJobSubmitRequestValidation:
                 JobSubmitRequest,
             )
 
+    def test_retry_policy_nested_backoff_flattened(self):
+        r = validate_request_type(
+            {
+                "entrypoint": "abc",
+                "retry_policy": {
+                    "max_retries": 3,
+                    "backoff": {
+                        "initial_delay_seconds": 5,
+                        "max_delay_seconds": 60,
+                        "multiplier": 3.0,
+                    },
+                    "retry_on": ["NON_ZERO_EXIT"],
+                    "no_retry_on_exit_codes": [130],
+                },
+            },
+            JobSubmitRequest,
+        )
+        # The nested backoff object is flattened into the stored dict.
+        assert r.retry_policy == {
+            "max_retries": 3,
+            "backoff_initial_delay_seconds": 5,
+            "backoff_max_delay_seconds": 60,
+            "backoff_multiplier": 3.0,
+            "retry_on": ["NON_ZERO_EXIT"],
+            "no_retry_on_exit_codes": [130],
+        }
+
+    def test_retry_policy_minimal(self):
+        r = validate_request_type(
+            {"entrypoint": "abc", "retry_policy": {"max_retries": 2}},
+            JobSubmitRequest,
+        )
+        assert r.retry_policy == {"max_retries": 2}
+
+    def test_retry_policy_invalid(self):
+        with pytest.raises(ValueError, match="max_retries must be non-negative"):
+            validate_request_type(
+                {"entrypoint": "abc", "retry_policy": {"max_retries": -1}},
+                JobSubmitRequest,
+            )
+
+        with pytest.raises(ValueError, match="backoff_multiplier must be >= 1"):
+            validate_request_type(
+                {
+                    "entrypoint": "abc",
+                    "retry_policy": {"backoff": {"multiplier": 0.5}},
+                },
+                JobSubmitRequest,
+            )
+
+        with pytest.raises(
+            ValueError, match="must be >= backoff_initial_delay_seconds"
+        ):
+            validate_request_type(
+                {
+                    "entrypoint": "abc",
+                    "retry_policy": {
+                        "backoff": {
+                            "initial_delay_seconds": 100,
+                            "max_delay_seconds": 10,
+                        }
+                    },
+                },
+                JobSubmitRequest,
+            )
+
+        with pytest.raises(ValueError, match="Invalid retry_on condition"):
+            validate_request_type(
+                {"entrypoint": "abc", "retry_policy": {"retry_on": ["BOGUS"]}},
+                JobSubmitRequest,
+            )
+
+        with pytest.raises(TypeError, match="no_retry_on_exit_codes must be a list"):
+            validate_request_type(
+                {
+                    "entrypoint": "abc",
+                    "retry_policy": {"no_retry_on_exit_codes": "130"},
+                },
+                JobSubmitRequest,
+            )
+
+        with pytest.raises(TypeError, match="Invalid retry_policy"):
+            # Unknown key in the retry policy.
+            validate_request_type(
+                {"entrypoint": "abc", "retry_policy": {"bogus_key": 1}},
+                JobSubmitRequest,
+            )
+
+        with pytest.raises(TypeError, match="retry_policy must be a dict"):
+            validate_request_type(
+                {"entrypoint": "abc", "retry_policy": "nope"},
+                JobSubmitRequest,
+            )
+
+
+class TestRetryPolicy:
+    def test_defaults(self):
+        policy = RetryPolicy()
+        assert policy.max_retries == 0
+        assert policy.retry_on is None
+        assert policy.no_retry_on_exit_codes is None
+
+    def test_valid_conditions(self):
+        policy = RetryPolicy(
+            retry_on=[
+                JobRetryCondition.NON_ZERO_EXIT.value,
+                JobRetryCondition.DRIVER_OOM.value,
+            ]
+        )
+        assert "NON_ZERO_EXIT" in policy.retry_on
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"max_retries": -1},
+            {"max_retries": "3"},
+            {"backoff_initial_delay_seconds": -1},
+            {"backoff_multiplier": 0},
+            {"backoff_initial_delay_seconds": 100, "backoff_max_delay_seconds": 10},
+            {"retry_on": ["NOPE"]},
+            {"no_retry_on_exit_codes": [1, "2"]},
+        ],
+    )
+    def test_invalid(self, kwargs):
+        with pytest.raises((TypeError, ValueError)):
+            RetryPolicy(**kwargs)
+
 
 def test_uri_to_http_and_back():
     assert uri_to_http_components("gcs://hello.zip") == ("gcs", "hello.zip")
@@ -230,11 +359,24 @@ def test_job_info_json_to_proto():
         runtime_env={"pip": ["pkg"]},
         driver_agent_http_address="http://localhost:1234",
         driver_node_id="node_id",
+        retry_policy={
+            "max_retries": 3,
+            "backoff_initial_delay_seconds": 5,
+            "backoff_max_delay_seconds": 60,
+            "backoff_multiplier": 2.0,
+            "retry_on": ["NON_ZERO_EXIT"],
+            "no_retry_on_exit_codes": [130],
+        },
+        attempt_number=2,
     )
     info_json = json.dumps(info.to_json())
     info_proto = Parse(info_json, JobsAPIInfo())
     assert info_proto.status == "PENDING"
     assert info_proto.entrypoint == "echo hi"
+    assert info_proto.retry_policy.max_retries == 3
+    assert info_proto.retry_policy.retry_on == ["NON_ZERO_EXIT"]
+    assert info_proto.retry_policy.no_retry_on_exit_codes == [130]
+    assert info_proto.attempt_number == 2
     assert info_proto.start_time == 123
     assert info_proto.end_time == 456
     assert info_proto.metadata == {"hi": "hi2"}

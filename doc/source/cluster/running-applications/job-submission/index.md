@@ -24,6 +24,37 @@ After a job is submitted, it runs once to completion or failure, regardless of t
 Retries or different runs with different parameters should be handled by the submitter.
 Jobs are bound to the lifetime of a Ray cluster, so if the cluster goes down, all running jobs on that cluster will be terminated.
 
+### Automatic in-place retries
+
+Optionally, you can configure a job to be retried automatically on failure by passing a `retry_policy`.
+When set, a retryable driver failure re-runs the driver **in place** using the same `submission_id` and the **same Ray cluster** (after an exponential backoff), instead of failing immediately.
+This lets the cluster's own fault tolerance recover worker failures while the job simply re-submits the driver, without recreating the cluster.
+
+For example, with the Python SDK:
+
+```python
+client.submit_job(
+    entrypoint="python train.py",
+    retry_policy={
+        "max_retries": 3,
+        "backoff": {
+            "initial_delay_seconds": 30,
+            "max_delay_seconds": 600,
+            "multiplier": 2.0,
+        },
+        "retry_on": ["NON_ZERO_EXIT"],
+        "no_retry_on_exit_codes": [130],
+    },
+)
+```
+
+The current attempt is observable via the `attempt_number` field of the job status (0 for the original run, 1 for the first retry, and so on).
+
+```{note}
+`DRIVER_OOM` is detected on a best-effort basis from exit code 137 (`128 + SIGKILL`), which is indistinguishable from an external `SIGKILL`.
+Head node failures are not covered by `retry_policy`; recovering from those still requires restarting the Ray cluster.
+```
+
 To get started with the Ray Jobs API, check out the [quickstart](jobs-quickstart) guide, which walks you through the CLI tools for submitting and interacting with a Ray Job.
 This is suitable for any client that can communicate over HTTP to the Ray Cluster.
 If needed, the Ray Jobs API also provides APIs for [programmatic job submission](ray-job-sdk) and [job submission using REST](ray-job-rest-api).
