@@ -639,6 +639,53 @@ def test_reduce_op_runs_when_an_input_is_missing(ray_start_regular_shared_2_cpus
     assert op.has_completed()
 
 
+def _yield_each_shard_reduce_fn(fail_partition=None):
+    """Yields one output block per shard, so a partition can yield several."""
+
+    def _reduce(partition_id, tables_by_input):
+        yield from tables_by_input[0]
+        if partition_id == fail_partition:
+            raise ValueError(f"reduce of partition {partition_id} failed")
+
+    return _reduce
+
+
+def test_reduce_op_emits_whole_partitions(ray_start_regular_shared_2_cpus):
+    """Each partition's output blocks come out together as one bundle."""
+    op = _make_multi_input_reduce_op(_yield_each_shard_reduce_fn(), num_inputs=1)
+    op.set_emit_whole_partitions()
+    op.start(ExecutionOptions(), noop_counter())
+    shards = [_ipc_shard_bundle(0, pa.table({"v": [v]})) for v in range(3)]
+    op.add_input(RefBundle.merge_ref_bundles(shards), 0)
+    op.add_input(_ipc_shard_bundle(1, pa.table({"v": [9]})), 0)
+    op.all_inputs_done()
+    run_op_tasks_sync(op)
+
+    outputs = {}
+    while op.has_next():
+        tables = [ray.get(ref) for ref in op.get_next().block_refs]
+        values = pa.concat_tables(tables).column("v").to_pylist()
+        outputs[len(tables)] = sorted(values)
+    assert outputs == {3: [0, 1, 2], 1: [9]}
+    assert op.metrics.obj_store_mem_internal_outqueue == 0
+
+
+def test_reduce_op_drops_failed_partition(ray_start_regular_shared_2_cpus):
+    """Blocks held for a partition whose reduce task fails aren't emitted."""
+    op = _make_multi_input_reduce_op(
+        _yield_each_shard_reduce_fn(fail_partition=0), num_inputs=1
+    )
+    op.set_emit_whole_partitions()
+    op.start(ExecutionOptions(), noop_counter())
+    op.add_input(_ipc_shard_bundle(0, pa.table({"v": [1]})), 0)
+    op.all_inputs_done()
+    with pytest.raises(Exception, match="reduce of partition 0 failed"):
+        run_op_tasks_sync(op)
+
+    assert not op.has_next()
+    assert op.metrics.obj_store_mem_internal_outqueue == 0
+
+
 _V2_OP_CLASSES = [
     (ShuffleMapOp, ShuffleReduceOp),
     (DiskHashShuffleMapOp, DiskHashShuffleReduceOp),
