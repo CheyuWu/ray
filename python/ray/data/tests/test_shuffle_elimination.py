@@ -366,6 +366,22 @@ def test_aggregate_shuffle_elimination(
     _assert_same_rows(ds, expected, keys)
 
 
+def test_groupby_with_limit_after_sort_skips_shuffle(ray_start_regular_shared_2_cpus):
+    """TPC-H q18 shape: the limit is behind the sort's shuffle, so it doesn't
+    keep the projection after the join from fusing into the join's reduce."""
+    joined = _join().select_columns(["id", "rval"])
+    ds = (
+        joined.groupby("id")
+        .aggregate(Sum(on="rval", alias_name="s"))
+        .sort("s", descending=True)
+        .limit(5)
+    )
+    assert _local_aggregates(_physical_dag(ds))
+
+    expected = _pandas_groupby(joined, ["id"], s=("rval", "sum")).nlargest(5, "s")
+    _assert_same_rows(ds, expected, ["id"])
+
+
 def test_left_outer_join_then_count(ray_start_regular_shared_2_cpus):
     """TPC-H q13 shape: unmatched keys must count as 0."""
     joined = _join("left_outer", right=_right().filter(expr=col("rid") < 60))

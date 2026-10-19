@@ -670,6 +670,35 @@ def test_map_not_fused_into_shuffle_reduce_with_downstream_limit(
     assert len(ds.take_all()) == 10
 
 
+def test_map_fused_into_shuffle_reduce_behind_another_shuffle_with_limit(
+    ray_start_regular_shared_2_cpus, restore_data_context
+):
+    """A shuffle reads all its input before it outputs anything, so a limit
+    above it can't stop work below it, and maps there can still be fused."""
+    ctx = DataContext.get_current()
+    ctx.shuffle_strategy = ShuffleStrategy.SHUFFLE_V2
+
+    ds = (
+        ray.data.range(100)
+        .repartition(4, keys=["id"])
+        .map_batches(lambda b: b)
+        .repartition(2, keys=["id"])
+        .limit(10)
+    )
+    dag = get_execution_plan(ds._logical_plan)[0].dag
+
+    assert dag.name == "limit=10"
+    (outer_reduce,) = dag.input_dependencies
+    assert outer_reduce.name == "HashShuffleReduce(keys=('id',), partitions=2)"
+    (outer_map,) = outer_reduce.input_dependencies
+    (inner_reduce,) = outer_map.input_dependencies
+    assert inner_reduce.name == (
+        "HashShuffleReduce(keys=('id',), partitions=4)->MapBatches(<lambda>)"
+    )
+
+    assert len(ds.take_all()) == 10
+
+
 def test_concurrency_capped_map_not_fused_into_shuffle_reduce(
     ray_start_regular_shared_2_cpus, restore_data_context
 ):

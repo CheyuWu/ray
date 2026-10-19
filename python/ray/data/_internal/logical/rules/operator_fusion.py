@@ -115,6 +115,10 @@ class FuseOperators(Rule):
             )
 
         has_downstream_limit = has_downstream_limit or isinstance(dag, LimitOperator)
+        # A shuffle only outputs once it has read all of its input, so a limit
+        # above it can't stop any work below it.
+        if isinstance(dag, (ShuffleReduceOp, DiskHashShuffleReduceOp)):
+            has_downstream_limit = False
         dag._input_dependencies = [
             self._fuse_map_into_shuffle_reduce_in_dag(upstream_op, has_downstream_limit)
             for upstream_op in dag.input_dependencies
