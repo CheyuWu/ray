@@ -1514,6 +1514,20 @@ py_test(
 )
 
 py_test(
+    name = "test_shuffle_elimination",
+    size = "medium",
+    srcs = ["tests/test_shuffle_elimination.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
     name = "test_execution_optimizer_basic",
     size = "small",
     srcs = ["tests/test_execution_optimizer_basic.py"],

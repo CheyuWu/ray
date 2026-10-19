@@ -2,6 +2,8 @@ import warnings
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Type, TypeVar
 
+import pyarrow as pa
+
 if TYPE_CHECKING:
     import pyarrow.fs
 
@@ -27,9 +29,16 @@ from ray.data._internal.execution.operators.join import (
 from ray.data._internal.execution.operators.limit_operator import LimitOperator
 from ray.data._internal.execution.operators.mix_operator import MixOperator
 from ray.data._internal.execution.operators.output_splitter import OutputSplitter
+from ray.data._internal.execution.operators.shuffle_operators.disk_shuffle_reduce_operator import (  # noqa: E501
+    DiskHashShuffleReduceOp,
+)
+from ray.data._internal.execution.operators.shuffle_operators.shuffle_reduce_operator import (  # noqa: E501
+    ShuffleReduceOp,
+)
 from ray.data._internal.execution.operators.union_operator import UnionOperator
 from ray.data._internal.execution.operators.zip_operator import ZipOperator
 from ray.data._internal.logical.interfaces import (
+    HashPartitioning,
     LogicalOperator,
     LogicalPlan,
     PhysicalPlan,
@@ -38,6 +47,7 @@ from ray.data._internal.logical.operators import (
     AbstractAllToAll,
     AbstractFrom,
     AbstractUDFMap,
+    Aggregate,
     Count,
     Download,
     Filter,
@@ -63,6 +73,7 @@ from ray.data._internal.planner.checkpoint import (
     plan_read_op_with_checkpoint_filter,
     plan_write_op_with_checkpoint_writer,
 )
+from ray.data._internal.planner.exchange.sort_task_spec import SortKey
 from ray.data._internal.planner.plan_all_to_all_op import (
     _select_shuffle_v2_op_classes,
     plan_all_to_all_op,
@@ -246,6 +257,57 @@ def plan_streaming_split_op(
     )
 
 
+_RIGHT_PRESERVING_JOIN_TYPES = (
+    JoinType.RIGHT_OUTER,
+    JoinType.RIGHT_SEMI,
+    JoinType.RIGHT_ANTI,
+)
+
+
+def _join_output_key_columns(join: Join) -> Optional[Tuple[str, ...]]:
+    """The output columns the join coalesces its keys into, if known."""
+    if join.join_type not in _RIGHT_PRESERVING_JOIN_TYPES:
+        return tuple(join.left_key_columns)
+    if join.join_type == JoinType.RIGHT_OUTER:
+        # If a left non-key column already has a right key's name, the keys
+        # coalesce into ``{right_key}{suffix}`` and that name holds left data.
+        left_schema = join.input_dependencies[0].infer_schema()
+        if not isinstance(left_schema, pa.Schema):
+            return None
+        left_non_key_columns = set(left_schema.names) - set(join.left_key_columns)
+        if left_non_key_columns & set(join.right_key_columns):
+            return None
+    return tuple(join.right_key_columns)
+
+
+def _derive_output_partitioning(
+    logical_op: LogicalOperator, physical_op: PhysicalOperator
+) -> Optional[HashPartitioning]:
+    """How ``physical_op``, planned for ``logical_op``, partitions its output."""
+    if isinstance(physical_op, (ShuffleReduceOp, DiskHashShuffleReduceOp)):
+        # A hash shuffle colocates equal keys; these are the output's key columns.
+        if isinstance(logical_op, Join):
+            key_columns = _join_output_key_columns(logical_op)
+        elif isinstance(logical_op, Aggregate):
+            key_columns = SortKey(logical_op.key).get_columns()
+        else:
+            return None
+        if not key_columns:
+            return None
+        return HashPartitioning(tuple(key_columns), physical_op._num_partitions)
+
+    # Per-row transforms keep their input's partitioning if the key columns
+    # pass through unchanged.
+    if not isinstance(logical_op, (Filter, Project)):
+        return None
+    partitioning = physical_op.input_dependencies[0].output_partitioning
+    if partitioning is None or isinstance(logical_op, Filter):
+        return partitioning
+    if logical_op.preserves_columns(partitioning.columns):
+        return partitioning
+    return None
+
+
 class Planner:
     """The planner to convert optimized logical to physical operators.
 
@@ -383,6 +445,9 @@ class Planner:
         # We will call `set_logical_operators()` in the following for-loop,
         # no need to do it here.
         physical_op = plan_fn(logical_op, physical_children, data_context)
+        output_partitioning = _derive_output_partitioning(logical_op, physical_op)
+        if output_partitioning is not None:
+            physical_op.set_output_partitioning(output_partitioning)
 
         # Traverse up the DAG, and set the mapping from physical to logical operators.
         # At this point, all physical operators without logical operators set

@@ -31,7 +31,11 @@ from ray.data._internal.execution.interfaces.execution_options import (
     ExecutionResources,
 )
 from ray.data._internal.execution.interfaces.op_runtime_metrics import OpRuntimeMetrics
-from ray.data._internal.logical.interfaces import LogicalOperator, Operator
+from ray.data._internal.logical.interfaces import (
+    HashPartitioning,
+    LogicalOperator,
+    Operator,
+)
 from ray.data._internal.output_buffer import OutputBlockSizeOption
 from ray.data._internal.stats import StatsDict, Timer
 from ray.data.block import (
@@ -662,6 +666,8 @@ class PhysicalOperator(Operator):
         # The LogicalOperator(s) which were translated to create this PhysicalOperator.
         # Set via `PhysicalOperator.set_logical_operators()`.
         self._logical_operators: List[LogicalOperator] = []
+        # Set via `PhysicalOperator.set_output_partitioning()`.
+        self._output_partitioning: Optional[HashPartitioning] = None
         self._data_context = data_context
         self._id = str(uuid.uuid4())
         # Initialize metrics after data_context is set
@@ -799,6 +805,18 @@ class PhysicalOperator(Operator):
         *logical_ops: LogicalOperator,
     ):
         self._logical_operators = list(logical_ops)
+
+    @property
+    def output_partitioning(self) -> Optional[HashPartitioning]:
+        """How this operator's output rows are partitioned, or ``None`` if unknown.
+
+        Says which rows share a partition, not that each partition arrives as
+        one bundle (see ``ShuffleReduceOp.set_emit_whole_partitions``).
+        """
+        return self._output_partitioning
+
+    def set_output_partitioning(self, partitioning: Optional[HashPartitioning]):
+        self._output_partitioning = partitioning
 
     @property
     def target_max_block_size_override(self) -> Optional[int]:

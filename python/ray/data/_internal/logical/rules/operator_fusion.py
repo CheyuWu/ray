@@ -443,6 +443,8 @@ class FuseOperators(Rule):
         fused_op.set_logical_operators(
             *up_op._logical_operators, *down_op._logical_operators
         )
+        # The map's partitioning already accounts for the reduce's.
+        fused_op.set_output_partitioning(down_op.output_partitioning)
         self._op_map[fused_op] = up_logical_op
         return fused_op
 
@@ -684,6 +686,8 @@ class FuseOperators(Rule):
             isolate_workers=isolate_workers,
         )
         op.set_logical_operators(*up_op._logical_operators, *down_op._logical_operators)
+        # The downstream map's partitioning already accounts for the upstream's.
+        op.set_output_partitioning(down_op.output_partitioning)
         for map_task_kwargs_fn in itertools.chain(
             up_op._map_task_kwargs_fns, down_op._map_task_kwargs_fns
         ):

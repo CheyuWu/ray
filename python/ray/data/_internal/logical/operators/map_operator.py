@@ -24,6 +24,8 @@ from ray.data._internal.logical.interfaces import (
 from ray.data._internal.logical.operators.one_to_one_operator import AbstractOneToOne
 from ray.data.block import UserDefinedFunction
 from ray.data.expressions import (
+    AliasExpr,
+    ColumnExpr,
     Expr,
     StarExpr,
     expand_projection_exprs,
@@ -502,6 +504,28 @@ class Project(AbstractMap, LogicalOperatorSupportsPredicatePassThrough):
 
         rename_map = _extract_input_columns_renaming_mapping(self.exprs)
         return rename_map if rename_map else None
+
+    def preserves_columns(self, columns: Iterable[str]) -> bool:
+        """Whether each of ``columns`` is output unchanged under its own name."""
+        # As in ``eval_projection``, the last expression with a name wins, and
+        # ``star()`` forwards every input column that isn't renamed away.
+        last_expr_by_name: Dict[str, Expr] = {}
+        for expr in self.exprs:
+            if not isinstance(expr, StarExpr):
+                last_expr_by_name[expr.name] = expr
+        renamed_away = set(self.get_column_substitutions() or {})
+        for column in columns:
+            expr = last_expr_by_name.get(column)
+            if expr is None:
+                if not self.has_star_expr() or column in renamed_away:
+                    return False
+                continue
+            while isinstance(expr, AliasExpr):
+                expr = expr.expr
+            is_same_column = isinstance(expr, ColumnExpr) and expr.name == column
+            if not is_same_column:
+                return False
+        return True
 
     def infer_schema(self) -> Optional["Schema"]:
         import pyarrow as pa
