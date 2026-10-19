@@ -8,9 +8,14 @@ from ray.data._internal.execution.operators.shuffle_operators.shuffle_tasks impo
     BlockTransformer,
     ReduceFn,
 )
-from ray.data.block import Block, BlockAccessor
+from ray.data._internal.table_block import TableBlockAccessor
+from ray.data.block import Block, BlockAccessor, BlockType
 
 if TYPE_CHECKING:
+    from ray.data._internal.execution.interfaces import TaskContext
+    from ray.data._internal.execution.operators.map_transformer import (
+        MapTransformCallable,
+    )
     from ray.data.aggregate import AggregateFn, AggregateFnV2
 
 
@@ -67,6 +72,33 @@ def _make_aggregating_reduce_fn(
     return _make_vectorized_aggregating_reduce_fn(
         key_columns, aggregation_fns
     ) or _fallback_aggregating_reduce_fn(key_columns, aggregation_fns)
+
+
+def _make_complete_aggregating_block_fn(
+    key_columns: Tuple[str, ...],
+    aggregation_fns: Tuple["AggregateFn", ...],
+) -> "MapTransformCallable[Block, Block]":
+    """One-phase aggregation: combines each block like the shuffle's map side,
+    then finalizes like its reduce side.
+
+    Only correct if the blocks hold every row of their groups.
+    """
+    combine = _make_aggregating_transformer(key_columns, aggregation_fns)
+    finalize = _make_aggregating_reduce_fn(key_columns, aggregation_fns)
+
+    def aggregate(blocks: Iterable[Block], ctx: "TaskContext") -> Iterable[Block]:
+        partials: List[pa.Table] = []
+        for block in blocks:
+            table = TableBlockAccessor.try_convert_block_type(
+                block, block_type=BlockType.ARROW
+            )
+            if table.num_rows > 0:
+                partials.append(combine(table))
+        # Like the shuffle's reduce, no rows means no groups and no block.
+        if partials:
+            yield from finalize(ctx.task_idx, [partials])
+
+    return aggregate
 
 
 def _make_vectorized_aggregating_transformer(

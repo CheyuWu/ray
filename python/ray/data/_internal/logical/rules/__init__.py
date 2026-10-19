@@ -18,6 +18,7 @@ from .set_read_parallelism import (
     SetReadParallelismRule,
     compute_additional_split_factor,
 )
+from .shuffle_elimination import EliminateRedundantShuffles
 
 __all__ = [
     "CombineDownloads",
@@ -26,6 +27,7 @@ __all__ = [
     "ConfigureMapTaskMemoryRule",
     "ConfigureMapTaskMemoryUsingOutputSize",
     "DeriveListFilesPushdown",
+    "EliminateRedundantShuffles",
     "FuseOperators",
     "InheritTargetMaxBlockSizeRule",
     "LimitPushdownRule",
